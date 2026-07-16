@@ -1,0 +1,239 @@
+# ==============================================================================
+# LLM Zoomcamp study stack
+# ==============================================================================
+# One compose file for all local services used across the course modules.
+# Each container has a single responsibility. Two Docker networks isolate
+# Kestra's internal state from the general study network.
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # notebook (container name: `studies`) — Jupyter Lab with GPU access.
+  # Playground for notebooks, agent code, and experiments. Bind-mounts the
+  # whole studies directory at /workspace, so files always live on the host
+  # and survive container recreation.
+  # ----------------------------------------------------------------------------
+  notebook:
+    build: .
+    container_name: studies
+    init: true
+    restart: unless-stopped
+    ports:
+      - "9811:8888"                # Host 9811 -> Jupyter 8888 inside container
+      - "8501:8501"                # Streamlit chat app (lesson 03)
+      - "8502:8502"                # Streamlit dashboard (lesson 07)
+
+    volumes:
+      - .:/workspace               # Bind mount: notebooks stay on the host
+    working_dir: /workspace
+    environment:
+      # Connection info the notebook reads via os.getenv(...) at runtime.
+      # Hostnames like "elasticsearch" and "pgvector" resolve on llm-net via
+      # Docker's internal DNS (service name = hostname).
+      JUPYTER_TOKEN: "${JUPYTER_TOKEN}"
+      ELASTIC_HOST: "http://elasticsearch:9200"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      POSTGRES_HOST: "pgvector"
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: "user"
+      POSTGRES_PASSWORD: "pswd"
+      POSTGRES_DB: "faq"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia       # GPU access (embeddings, local LLM)
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      - elasticsearch
+      - pgvector
+    networks:
+      - llm-net
+
+  # ----------------------------------------------------------------------------
+  # elasticsearch — one tool for text search, vector search, and hybrid.
+  # Uses the `dense_vector` field type (available since 7.14) for kNN search,
+  # combined with BM25 for keyword search. This is the primary retrieval
+  # engine for the final Obsidian agent project.
+  # ----------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.4.3
+    container_name: elasticsearch
+    restart: unless-stopped
+    mem_limit: 8g
+    environment:
+      ES_JAVA_OPTS: "-Xms4g -Xmx4g"       # JVM heap: 4 GB min and max
+      discovery.type: single-node
+      xpack.security.enabled: "false"     # No auth (local dev only)
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - llm-net
+
+  # ----------------------------------------------------------------------------
+  # pgvector — Postgres 17 with the `vector` extension enabled.
+  # Kept for module 2 study (the SQL flavor of vector search). Can be removed
+  # later if the final project settles on Elasticsearch alone.
+  # ----------------------------------------------------------------------------
+  pgvector:
+    image: pgvector/pgvector:pg18
+    container_name: pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: faq
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pswd
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgvector_data:/var/lib/postgresql   # pg18+ mount convention (parent
+                                            # dir, not /data subdir)
+    networks:
+      - llm-net
+  # ----------------------------------------------------------------------------
+  # grafana — dashboards over the monitoring data in Postgres (module 5).
+  # Reaches pgvector by service name on llm-net. Dashboards and datasources
+  # persist in the grafana_data volume.
+  # ----------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - pgvector
+    networks:
+      - llm-net
+  # ----------------------------------------------------------------------------
+  # kestra_postgres — dedicated Postgres for Kestra's internal state ONLY.
+  #
+  # ISOLATED: sits on `kestra-net` and NOT on `llm-net`. The `notebook`
+  # container physically cannot reach it. Verify with:
+  #   docker compose exec studies getent hosts kestra_postgres
+  # (should return nothing).
+  #
+  # No ports published: only reachable inside kestra-net.
+  # ----------------------------------------------------------------------------
+  kestra_postgres:
+    image: postgres:18
+    container_name: kestra_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: k3str4
+    volumes:
+      - kestra_postgres_data:/var/lib/postgresql   # pg18+ mount convention
+    networks:
+      - kestra-net
+
+  # ----------------------------------------------------------------------------
+  # kestra — workflow orchestrator with native AI plugins (RAG, Agents,
+  # Copilot). Dual-network member:
+  #   - kestra-net: to talk to its private Postgres backend.
+  #   - llm-net:    to be reachable from the notebook (Python client can
+  #                 call http://kestra:8080 from inside `studies`).
+  #
+  # Secrets: any env var prefixed `SECRET_*` becomes a Kestra secret. Inside
+  # flows, reference them as {{ secret('KEY_NAME') }} (no SECRET_ prefix,
+  # Kestra strips it). Values are base64-encoded; Kestra decodes at runtime.
+  #
+  # KESTRA_CONFIGURATION is a special env var containing the entire Kestra
+  # config as a multi-line YAML string. Instead of mounting a config file,
+  # Kestra reads its config from this variable on startup.
+  # ----------------------------------------------------------------------------
+  kestra:
+    image: kestra/kestra:v1.3.21
+    container_name: kestra
+    restart: unless-stopped
+    user: "root"
+    command: server standalone
+    volumes:
+      - kestra_data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock  # Lets Kestra spawn tasks
+                                                   # as Docker containers
+      - /tmp/kestra-wd:/tmp/kestra-wd              # Task working directory
+    environment:
+      # Kestra secret store (base64-encoded).
+      SECRET_GEMINI_API_KEY: ${SECRET_GEMINI_API_KEY}
+      SECRET_TAVILY_API_KEY: ${SECRET_TAVILY_API_KEY}
+      SECRET_OPENAI_API_KEY: ${SECRET_OPENAI_API_KEY}
+      # Full Kestra config, injected as a multi-line YAML string.
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://kestra_postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: k3str4
+        kestra:
+          server:
+            basicAuth:
+              username: "admin@kestra.io"
+              password: Admin1234!
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              basePath: "/app/storage"
+          queue:
+            type: postgres
+          tasks:
+            tmpDir:
+              path: /tmp/kestra-wd/tmp
+          url: http://localhost:8080/
+          ai:
+            # AI Copilot config (the sparkle button inside the Kestra UI).
+            # Needs the RAW (non-base64) Gemini key here.
+            type: gemini
+            gemini:
+              model-name: gemini-2.5-flash
+              api-key: ${GEMINI_API_KEY}
+    ports:
+      - "8080:8080"                 # Web UI + REST API
+      - "8081:8081"                 # Internal health check endpoint
+    depends_on:
+      - kestra_postgres
+    networks:
+      - kestra-net
+      - llm-net
+
+# ==============================================================================
+# Networks
+# ==============================================================================
+# llm-net    — shared network. Every service the notebook needs to reach
+#              lives here (elasticsearch, pgvector, kestra).
+# kestra-net — private network for Kestra and its Postgres. Not accessible
+#              from the notebook container. Enforces isolation of the
+#              orchestrator's internal state.
+# ==============================================================================
+networks:
+  llm-net:
+    driver: bridge
+  kestra-net:
+    driver: bridge
+
+# ==============================================================================
+# Named volumes (persist across container recreation and restarts)
+# ==============================================================================
+# es_data              — Elasticsearch indices
+# pgvector_data        — Postgres data (databases, embeddings)
+# kestra_postgres_data — Kestra internal state (flows, executions, queue)
+# kestra_data          — Kestra file storage (flow YAMLs, task outputs)
+# ==============================================================================
+volumes:
+  es_data:
+  pgvector_data:
+  kestra_postgres_data:
+  kestra_data:
+  grafana_data:
+
